@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple, Iterable, Type
 from zipfile import ZipFile
 
 import numpy as np
-import pytorch_transformers
+import transformers
 import torch
 from numpy import ndarray
 from torch import nn, Tensor
@@ -66,6 +66,13 @@ class SentenceTransformer(nn.Sequential):
             #### Load from disk
             if model_path is not None:
                 logging.info("Load SentenceTransformer from folder: {}".format(model_path))
+
+                if os.path.exists(os.path.join(model_path, 'config.json')):
+                    with open(os.path.join(model_path, 'config.json')) as fIn:
+                        config = json.load(fIn)
+                        if config['__version__'] > __version__:
+                            logging.warning("You try to use a model that was created with version {}, however, your version is {}. This might cause unexpected behavior or errors. In that case, try to update to the latest version.\n\n\n".format(config['__version__'], __version__))
+
                 with open(os.path.join(model_path, 'modules.json')) as fIn:
                     contained_modules = json.load(fIn)
 
@@ -142,6 +149,12 @@ class SentenceTransformer(nn.Sequential):
 
         return all_embeddings
 
+    def get_max_seq_length(self):
+        if hasattr(self._first_module(), 'max_seq_length'):
+            return self._first_module().max_seq_length
+
+        return None
+
     def tokenize(self, text):
         return self._first_module().tokenize(text)
 
@@ -163,6 +176,9 @@ class SentenceTransformer(nn.Sequential):
         """
         Saves all elements for this seq. sentence embedder into different sub-folders
         """
+        if path is None:
+            return
+
         logging.info("Save model to {}".format(path))
         contained_modules = []
 
@@ -224,9 +240,10 @@ class SentenceTransformer(nn.Sequential):
             train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
             evaluator: SentenceEvaluator,
             epochs: int = 1,
+            steps_per_epoch = None,
             scheduler: str = 'WarmupLinear',
             warmup_steps: int = 10000,
-            optimizer_class: Type[Optimizer] = pytorch_transformers.AdamW,
+            optimizer_class: Type[Optimizer] = transformers.AdamW,
             optimizer_params : Dict[str, object ]= {'lr': 2e-5, 'eps': 1e-6, 'correct_bias': False},
             weight_decay: float = 0.01,
             evaluation_steps: int = 0,
@@ -234,7 +251,7 @@ class SentenceTransformer(nn.Sequential):
             save_best_model: bool = True,
             max_grad_norm: float = 1,
             fp16: bool = False,
-            fp16_opt_level: str = '01',
+            fp16_opt_level: str = 'O1',
             local_rank: int = -1
             ):
         """
@@ -259,6 +276,7 @@ class SentenceTransformer(nn.Sequential):
             Tuples of DataLoader and LossConfig
         :param evaluator:
         :param epochs:
+        :param steps_per_epoch: Train for x steps in each epoch. If set to None, the length of the dataset will be used
         """
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
@@ -273,20 +291,23 @@ class SentenceTransformer(nn.Sequential):
             dataloader.collate_fn = self.smart_batching_collate
 
         loss_models = [loss for _, loss in train_objectives]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self.device
         for loss_model in loss_models:
             loss_model.to(device)
 
-        self.best_score = -9999
+        self.best_score = -9999999
 
-        min_batch_size = min([len(dataloader) for dataloader in dataloaders])
-        num_train_steps = int(min_batch_size * epochs)
+        if steps_per_epoch is None or steps_per_epoch == 0:
+            steps_per_epoch = min([len(dataloader) for dataloader in dataloaders])
+
+        num_train_steps = int(steps_per_epoch * epochs)
 
         # Prepare optimizers
         optimizers = []
         schedulers = []
         for loss_model in loss_models:
             param_optimizer = list(loss_model.named_parameters())
+
             no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
             optimizer_grouped_parameters = [
                 {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
@@ -297,10 +318,10 @@ class SentenceTransformer(nn.Sequential):
                 t_total = t_total // torch.distributed.get_world_size()
 
             optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
-            scheduler = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=t_total)
+            scheduler_obj = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=t_total)
 
             optimizers.append(optimizer)
-            schedulers.append(scheduler)
+            schedulers.append(scheduler_obj)
 
         if fp16:
             try:
@@ -308,15 +329,16 @@ class SentenceTransformer(nn.Sequential):
             except ImportError:
                 raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-            for idx in range(len(loss_models)):
-                model, optimizer = amp.initialize(loss_models[idx], optimizers[idx], opt_level=fp16_opt_level)
-                loss_models[idx] = model
-                optimizers[idx] = optimizer
+            for train_idx in range(len(loss_models)):
+                model, optimizer = amp.initialize(loss_models[train_idx], optimizers[train_idx], opt_level=fp16_opt_level)
+                loss_models[train_idx] = model
+                optimizers[train_idx] = optimizer
 
         global_step = 0
         data_iterators = [iter(dataloader) for dataloader in dataloaders]
 
         num_train_objectives = len(train_objectives)
+
         for epoch in trange(epochs, desc="Epoch"):
             training_steps = 0
 
@@ -324,38 +346,38 @@ class SentenceTransformer(nn.Sequential):
                 loss_model.zero_grad()
                 loss_model.train()
 
-            for step in trange(num_train_objectives * min_batch_size, desc="Iteration"):
-                idx = step % num_train_objectives
+            for _ in trange(steps_per_epoch, desc="Iteration", smoothing=0.05):
+                for train_idx in range(num_train_objectives):
+                    loss_model = loss_models[train_idx]
+                    optimizer = optimizers[train_idx]
+                    scheduler = schedulers[train_idx]
+                    data_iterator = data_iterators[train_idx]
 
-                loss_model = loss_models[idx]
-                optimizer = optimizers[idx]
-                scheduler = schedulers[idx]
-                data_iterator = data_iterators[idx]
+                    try:
+                        data = next(data_iterator)
+                    except StopIteration:
+                        #logging.info("Restart data_iterator")
+                        data_iterator = iter(dataloaders[train_idx])
+                        data_iterators[train_idx] = data_iterator
+                        data = next(data_iterator)
 
-                try:
-                    data = next(data_iterator)
-                except StopIteration:
-                    logging.info("Restart data_iterator")
-                    data_iterator = iter(dataloaders[idx])
-                    data_iterators[idx] = data_iterator
-                    data = next(data_iterator)
+                    features, labels = batch_to_device(data, self.device)
+                    loss_value = loss_model(features, labels)
 
-                features, labels = batch_to_device(data, self.device)
-                loss_value = loss_model(features, labels)
 
-                if fp16:
-                    with amp.scale_loss(loss_value, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
-                else:
-                    loss_value.backward()
-                    torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+                    if fp16:
+                        with amp.scale_loss(loss_value, optimizer) as scaled_loss:
+                            scaled_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), max_grad_norm)
+                    else:
+                        loss_value.backward()
+                        torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
                 training_steps += 1
-
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
                 global_step += 1
 
                 if evaluation_steps > 0 and training_steps % evaluation_steps == 0:
@@ -394,14 +416,14 @@ class SentenceTransformer(nn.Sequential):
         """
         scheduler = scheduler.lower()
         if scheduler == 'constantlr':
-            return pytorch_transformers.ConstantLRSchedule(optimizer)
+            return transformers.get_constant_schedule(optimizer)
         elif scheduler == 'warmupconstant':
-            return pytorch_transformers.WarmupConstantSchedule(optimizer, warmup_steps=warmup_steps)
+            return transformers.get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
         elif scheduler == 'warmuplinear':
-            return pytorch_transformers.WarmupLinearSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+            return transformers.get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
         elif scheduler == 'warmupcosine':
-            return pytorch_transformers.WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+            return transformers.get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
         elif scheduler == 'warmupcosinewithhardrestarts':
-            return pytorch_transformers.WarmupCosineWithHardRestartsSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+            return transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
         else:
             raise ValueError("Unknown scheduler {}".format(scheduler))
